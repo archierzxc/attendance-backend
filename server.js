@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcryptjs');
@@ -8,30 +9,36 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const SECRET = process.env.JWT_SECRET || 'attendance_secret_key_change_in_production';
+// Use the secret from environment variables
+const SECRET = process.env.JWT_SECRET || 'any_long_secret_string_you_make_up';
 
-// Database Connection - Updated for Aiven SSL Requirement
+// -----------------
+// Database Connection (Aiven MySQL SSL Optimized)
+// -----------------
 const db = mysql.createConnection({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
-    port: process.env.DB_PORT,
-    // Aiven requires SSL to connect securely
+    port: process.env.DB_PORT || 26437,
     ssl: {
-        rejectUnauthorized: false
+        // rejectUnauthorized: false allows connection even if the CA cert isn't manually provided
+        rejectUnauthorized: false 
     }
 });
 
 db.connect(err => {
-    if (err) { 
-        console.error('DB connection failed:', err); 
+    if (err) {
+        console.error('DB connection failed:', err);
     } else {
-        console.log('Connected to MySQL Database (Aiven)');
+        console.log('Connected to Aiven MySQL');
         initDB();
     }
 });
 
+// -----------------
+// Initialize Tables
+// -----------------
 function initDB() {
     db.query(`CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -61,29 +68,44 @@ function initDB() {
         FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`);
-
-    console.log('Database tables ready');
+    console.log('Database tables verified/created');
 }
 
-// Middleware: verify JWT
+// -----------------
+// Middleware: JWT auth (Handles Bearer prefix from Android)
+// -----------------
 function auth(req, res, next) {
-    const token = req.headers['authorization'];
+    let token = req.headers['authorization'];
     if (!token) return res.status(401).json({ error: 'No token provided' });
+
+    // Important: Strip "Bearer " if it exists from Retrofit
+    if (token.startsWith('Bearer ')) {
+        token = token.slice(7, token.length);
+    }
+
     try {
-        req.user = jwt.verify(token, SECRET);
+        const decoded = jwt.verify(token, SECRET);
+        req.user = decoded;
         next();
-    } catch {
+    } catch (err) {
+        console.error("JWT Error:", err.message);
         res.status(401).json({ error: 'Invalid token' });
     }
 }
 
-// --- AUTH ---
+// -----------------
+// Auth Routes
+// -----------------
 app.post('/api/register', (req, res) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ error: 'All fields required' });
+
     const hashed = bcrypt.hashSync(password, 10);
     db.query('INSERT INTO users (name, email, password) VALUES (?, ?, ?)', [name, email, hashed], (err, result) => {
-        if (err) return res.status(400).json({ error: 'Email already exists' });
+        if (err) {
+            console.error(err);
+            return res.status(400).json({ error: 'Email already exists or database error' });
+        }
         const token = jwt.sign({ id: result.insertId, name, email }, SECRET, { expiresIn: '7d' });
         res.json({ token, user: { id: result.insertId, name, email } });
     });
@@ -93,14 +115,18 @@ app.post('/api/login', (req, res) => {
     const { email, password } = req.body;
     db.query('SELECT * FROM users WHERE email = ?', [email], (err, rows) => {
         if (err || rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
+        
         const user = rows[0];
         if (!bcrypt.compareSync(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
+        
         const token = jwt.sign({ id: user.id, name: user.name, email: user.email }, SECRET, { expiresIn: '7d' });
         res.json({ token, user: { id: user.id, name: user.name, email: user.email } });
     });
 });
 
-// --- SUBJECTS ---
+// -----------------
+// Subject Routes
+// -----------------
 app.get('/api/subjects', auth, (req, res) => {
     const sql = `SELECT s.*, 
         COUNT(CASE WHEN a.status='Present' THEN 1 END) AS present_count,
@@ -108,6 +134,7 @@ app.get('/api/subjects', auth, (req, res) => {
         COUNT(CASE WHEN a.status='Leave'   THEN 1 END) AS leave_count
         FROM subjects s LEFT JOIN attendance a ON a.subject_id = s.id
         WHERE s.user_id = ? GROUP BY s.id ORDER BY s.id ASC`;
+        
     db.query(sql, [req.user.id], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
@@ -123,14 +150,25 @@ app.post('/api/subjects', auth, (req, res) => {
         });
 });
 
+app.put('/api/subjects/:id', auth, (req, res) => {
+    const { name, code, schedule, total_classes } = req.body;
+    db.query('UPDATE subjects SET name=?, code=?, schedule=?, total_classes=? WHERE id=? AND user_id=?',
+        [name, code, schedule, total_classes, req.params.id, req.user.id], (err) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ message: 'Updated successfully' });
+        });
+});
+
 app.delete('/api/subjects/:id', auth, (req, res) => {
     db.query('DELETE FROM subjects WHERE id=? AND user_id=?', [req.params.id, req.user.id], (err) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json({ message: 'Deleted' });
+        res.json({ message: 'Deleted successfully' });
     });
 });
 
-// --- ATTENDANCE ---
+// -----------------
+// Attendance & Stats
+// -----------------
 app.post('/api/attendance', auth, (req, res) => {
     const { subject_id, status, date } = req.body;
     db.query(`INSERT INTO attendance (subject_id, user_id, status, date) VALUES (?,?,?,?)`,
@@ -152,6 +190,8 @@ app.get('/api/stats', auth, (req, res) => {
     });
 });
 
-// Render Port Setup
+// -----------------
+// Start Server
+// -----------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
